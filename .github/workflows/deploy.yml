@@ -1,0 +1,46 @@
+name: CI/CD to Server
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. Checkout code
+        uses: actions/checkout@v4
+
+      - name: 2. Deploy to Server via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            cd /root/phamdoanquoctuan/bt_ci_cd/team/my-app
+            git pull origin main
+            docker compose up -d --build
+
+      - name: 3. Verify Deployment (Health Check)
+        run: |
+          echo "Đang kiểm tra trạng thái ứng dụng..."
+          SERVER_IP="${{ secrets.SERVER_HOST }}"
+          URL="http://${SERVER_IP}:3000"
+
+          for i in $(seq 1 10); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$URL" || echo "000")
+
+            if [ "$code" -eq 200 ]; then
+              echo "✅ Thành công! Ứng dụng phản hồi HTTP 200 (Lần thử: $i)"
+              exit 0
+            fi
+
+            echo "⏳ Lần thử $i: HTTP $code - App đang khởi động, đợi 5s..."
+            sleep 5
+          done
+
+          echo "❌ Thất bại! Ứng dụng không phản hồi sau 10 lần thử."
+          exit 1
