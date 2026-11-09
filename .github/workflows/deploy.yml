@@ -2,22 +2,52 @@ name: CI/CD
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
   workflow_dispatch:
 
+# Deploy lần trước chưa xong thì chờ, không chạy chồng. PR cũ thì được hủy khi có commit mới.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  APP_DIR: /root/phamdoanquoctuan/bt_ci_cd/team/my-app
+  DOMAIN: hloi0408.click
+
 jobs:
+  # ================= Lọc theo đường dẫn (paths) =================
+  # Báo cho job nginx biết có file nginx/ hoặc docker-compose.yml thay đổi hay không.
+  changes:
+    name: Kiểm tra file thay đổi
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      nginx: ${{ steps.filter.outputs.nginx }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            nginx:
+              - 'nginx/**'
+              - 'docker-compose.yml'
+
   # ================= CI: Frontend =================
   frontend-ci:
     name: CI - Frontend
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
 
       - uses: actions/setup-node@v5
         with:
-          node-version: 24
+          node-version: 22
           cache: npm
 
       - name: Cài thư viện
@@ -36,6 +66,7 @@ jobs:
   backend-ci:
     name: CI - Backend
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: backend
@@ -51,12 +82,13 @@ jobs:
       - name: Test và build
         run: mvn -B verify
 
-  # ================= CD: Deploy =================
+  # ================= CD: Deploy ứng dụng (Docker) =================
   deploy:
     name: CD - Deploy to Server
     needs: [frontend-ci, backend-ci]
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - name: 1. Checkout code
         uses: actions/checkout@v5
@@ -71,7 +103,7 @@ jobs:
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           source: "."
-          target: "/root/phamdoanquoctuan/bt_ci_cd/team/my-app"
+          target: "${{ env.APP_DIR }}"
 
       - name: 2c. Build & run on server
         uses: appleboy/ssh-action@v1.0.3
@@ -81,11 +113,11 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
             set -e
-            cd /root/phamdoanquoctuan/bt_ci_cd/team/my-app
+            cd ${{ env.APP_DIR }}
             docker compose up -d --build --remove-orphans
-            docker compose restart nginx
+            docker compose ps
             docker image prune -f
-            
+
       - name: 3. Verify Deployment (Health Check)
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -107,9 +139,124 @@ jobs:
               echo "❌ $name không phản hồi"
               return 1
             }
-            check "Frontend" "http://localhost:3000"
-            check "Backend"  "http://localhost:8080/health"
-                        check "Frontend" "http://localhost:3000"
-            check "Backend"  "http://localhost:8080/health"
-            check "Nginx → Frontend" "http://localhost:8880"
-            check "Nginx → Backend"  "http://localhost:8880/api/info"
+            check "Frontend (container)" "http://127.0.0.1:3000"
+            check "Backend (container)"  "http://127.0.0.1:8080/health"
+
+      - name: 4. In log container khi lỗi
+        if: failure()
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd ${{ env.APP_DIR }}
+            docker compose ps
+            docker compose logs --tail=60
+
+  # ================= CD: Nginx host + SSL (chỉ chạy khi nginx/ hoặc docker-compose.yml đổi) =================
+  nginx:
+    name: CD - Nginx host + SSL
+    needs: [changes, deploy]
+    if: >-
+      github.event_name != 'pull_request' && github.ref == 'refs/heads/main' &&
+      (needs.changes.outputs.nginx == 'true' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # Bước "Copy code to server" ở job deploy đã đưa nginx/default.conf lên ${{ env.APP_DIR }}/nginx/
+      - name: 1. Cài conf vào sites-available/group4, symlink, xin certbot
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            D=${{ env.DOMAIN }}
+            EMAIL='${{ secrets.CERTBOT_EMAIL }}'
+            SRC=${{ env.APP_DIR }}/nginx/default.conf
+            SITE=/etc/nginx/sites-available/group4
+            ENABLED=/etc/nginx/sites-enabled/group4
+            CERT=/etc/letsencrypt/live/$D/fullchain.pem
+            SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
+
+            command -v nginx >/dev/null || { echo "❌ Server chưa cài nginx"; exit 1; }
+            [ -f "$SRC" ] || { echo "❌ Không thấy $SRC"; exit 1; }
+            [ -n "$EMAIL" ] || { echo "❌ Thiếu secret CERTBOT_EMAIL"; exit 1; }
+
+            # --- 1. Cài certbot nếu chưa có ---
+            if ! command -v certbot >/dev/null; then
+              $SUDO apt-get update -y
+              $SUDO apt-get install -y certbot
+            fi
+            $SUDO mkdir -p /var/www/certbot
+
+            # --- 2. Cài 1 file conf: copy -> symlink -> nginx -t -> reload. Lỗi thì trả lại bản cũ ---
+            apply() {
+              if [ -f "$SITE" ]; then $SUDO cp "$SITE" /tmp/group4.bak; else rm -f /tmp/group4.bak; fi
+              $SUDO cp "$1" "$SITE"
+              $SUDO ln -sf "$SITE" "$ENABLED"
+              if ! $SUDO nginx -t; then
+                echo "❌ nginx -t lỗi, khôi phục bản cũ"
+                if [ -f /tmp/group4.bak ]; then $SUDO cp /tmp/group4.bak "$SITE"; else $SUDO rm -f "$SITE" "$ENABLED"; fi
+                exit 1
+              fi
+              $SUDO systemctl reload nginx
+              echo "✅ Đã cài $1 và reload nginx"
+            }
+
+            # --- 3. Xin chứng chỉ (webroot, không dừng nginx vì server dùng chung) ---
+            issue_cert() {
+              DOMAINS="-d $D"
+              if getent hosts "www.$D" >/dev/null; then DOMAINS="$DOMAINS -d www.$D"; else echo "⚠️ Chưa có DNS www.$D, bỏ qua www"; fi
+              $SUDO certbot certonly --webroot -w /var/www/certbot $DOMAINS \
+                --cert-name "$D" --email "$EMAIL" \
+                --agree-tos --no-eff-email --non-interactive \
+                --keep-until-expiring --expand \
+                --deploy-hook "systemctl reload nginx"
+            }
+
+            if [ -f "$CERT" ]; then
+              apply "$SRC"
+              issue_cert
+            else
+              echo "→ Lần đầu: chưa có chứng chỉ, tạm dùng conf HTTP để Let's Encrypt kiểm tra"
+              printf '%s\n' \
+                "server {" \
+                "    listen 80;" \
+                "    server_name $D www.$D;" \
+                "    location /.well-known/acme-challenge/ { root /var/www/certbot; }" \
+                "    location / { return 503; }" \
+                "}" > /tmp/group4-bootstrap.conf
+              apply /tmp/group4-bootstrap.conf
+              issue_cert
+              apply "$SRC"
+            fi
+
+            # --- 4. Gia hạn tự động do certbot.timer của hệ thống lo ---
+            if $SUDO systemctl is-enabled certbot.timer >/dev/null 2>&1; then
+              echo "✅ Gia hạn tự động: certbot.timer đang bật"
+            else
+              echo "⚠️ certbot.timer chưa bật, chạy: sudo systemctl enable --now certbot.timer"
+            fi
+
+      - name: 2. Kiểm tra HTTPS qua nginx host
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            D=${{ env.DOMAIN }}
+            # --resolve: gọi thẳng nginx trên chính server, không đi qua Cloudflare
+            probe() { curl -sk -o /dev/null -w "%{http_code}" --max-time 5 --resolve "$D:443:127.0.0.1" "https://$D$1"; }
+            for p in / /api/info; do
+              for i in $(seq 1 6); do
+                code=$(probe $p)
+                [ "$code" = "200" ] && break
+                echo "⏳ $p lần $i: HTTP $code"; sleep 5
+              done
+              [ "$code" = "200" ] || { echo "❌ https://$D$p trả HTTP $code"; exit 1; }
+              echo "✅ https://$D$p OK"
+            done
