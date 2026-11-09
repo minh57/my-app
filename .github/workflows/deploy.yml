@@ -83,8 +83,9 @@ jobs:
             set -e
             cd /root/phamdoanquoctuan/bt_ci_cd/team/my-app
             docker compose up -d --build --remove-orphans
+            docker compose restart nginx
             docker image prune -f
-
+            
       - name: 3. Verify Deployment (Health Check)
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -108,3 +109,7 @@ jobs:
             }
             check "Frontend" "http://localhost:3000"
             check "Backend"  "http://localhost:8080/health"
+                        check "Frontend" "http://localhost:3000"
+            check "Backend"  "http://localhost:8080/health"
+            check "Nginx → Frontend" "http://localhost:8880"
+            check "Nginx → Backend"  "http://localhost:8880/api/info"
