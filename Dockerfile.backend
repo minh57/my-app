@@ -1,13 +1,21 @@
-# Giai đoạn 1: Build file .jar bằng Maven và Java 21
-FROM maven:3.9.6-eclipse-temurin-21 AS build
-WORKDIR /app
-COPY backend/pom.xml .
-COPY backend/src ./src
-RUN mvn clean package -DskipTests
+# ===== Backend: Spring Boot, Java 21 =====
+# Build context là thư mục gốc repo (xem docker-compose.yml), nên COPY có tiền tố backend/
 
-# Giai đoạn 2: Chạy file .jar với môi trường Java 21 siêu nhẹ
+# --- Giai đoạn 1: build file .jar ---
+FROM maven:3.9-eclipse-temurin-21 AS build
+WORKDIR /app
+# Tải thư viện trước: pom.xml không đổi thì Docker dùng lại cache, build nhanh hơn nhiều
+COPY backend/pom.xml .
+RUN mvn -B dependency:go-offline
+COPY backend/src ./src
+RUN mvn -B clean package -DskipTests
+
+# --- Giai đoạn 2: chạy bằng JRE nhẹ, user thường ---
 FROM eclipse-temurin:21-jre-alpine
 WORKDIR /app
-COPY --from=build /app/target/*.jar app.jar
+RUN addgroup -S spring && adduser -S spring -G spring
+COPY --from=build --chown=spring:spring /app/target/*.jar app.jar
+USER spring
 EXPOSE 8080
-ENTRYPOINT ["java", "-jar", "app.jar"]
+# MaxRAMPercentage: JVM không chiếm quá 75% RAM của container (server dùng chung)
+ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75", "-jar", "app.jar"]
