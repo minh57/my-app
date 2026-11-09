@@ -1,14 +1,23 @@
+# Nginx chạy ngoài host (/etc/nginx/sites-available/group4), nên compose chỉ có FE + BE.
+# Hai cổng chỉ mở ở 127.0.0.1 để nginx host gọi vào; internet không truy cập thẳng được.
 services:
   frontend:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_USE_MOCK_API: ${NEXT_PUBLIC_USE_MOCK_API:-false}
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-https://hloi0408.click}
     container_name: team-frontend
     ports:
-      - "3000:3000"
-    env_file:
-      - .env
+      - "127.0.0.1:3000:3000"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO", "/dev/null", "http://127.0.0.1:3000/"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
   backend:
     build:
@@ -16,19 +25,14 @@ services:
       dockerfile: Dockerfile.backend
     container_name: team-backend
     ports:
-      - "8080:8080"
-    env_file:
-      - .env
+      - "127.0.0.1:8080:8080"
+    environment:
+      # Spring tự map APP_FRONTEND_ORIGIN -> app.frontend-origin (CORS)
+      APP_FRONTEND_ORIGIN: ${APP_FRONTEND_ORIGIN:-https://hloi0408.click}
     restart: unless-stopped
-
-  nginx:
-    image: nginx:alpine
-    container_name: nginx-proxy
-    ports:
-      - "8880:80"
-    volumes:
-      - ./nginx:/etc/nginx/conf.d:ro
-    restart: unless-stopped
-    depends_on:
-      - frontend
-      - backend
+    healthcheck:
+      test: ["CMD", "wget", "-qO", "/dev/null", "http://127.0.0.1:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
