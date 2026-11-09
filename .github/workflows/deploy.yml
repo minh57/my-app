@@ -1,16 +1,65 @@
-name: CI/CD to Server
+name: CI/CD
 
 on:
   push:
     branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
-  deploy:
+  # ================= CI: Frontend =================
+  frontend-ci:
+    name: CI - Frontend
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
 
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Cài thư viện
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+  # ================= CI: Backend =================
+  backend-ci:
+    name: CI - Backend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: maven
+
+      - name: Test và build
+        run: mvn -B verify
+
+  # ================= CD: Deploy =================
+  deploy:
+    name: CD - Deploy to Server
+    needs: [frontend-ci, backend-ci]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
     steps:
       - name: 1. Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: 2a. Remove .git before copying
         run: rm -rf .git
@@ -33,25 +82,29 @@ jobs:
           script: |
             set -e
             cd /root/phamdoanquoctuan/bt_ci_cd/team/my-app
-            docker compose up -d --build
+            docker compose up -d --build --remove-orphans
+            docker image prune -f
 
       - name: 3. Verify Deployment (Health Check)
-        run: |
-          echo "Đang kiểm tra trạng thái ứng dụng..."
-          SERVER_IP="${{ secrets.SERVER_HOST }}"
-          URL="http://${SERVER_IP}:3000"
-
-          for i in $(seq 1 10); do
-            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$URL" || echo "000")
-
-            if [ "$code" -eq 200 ]; then
-              echo "✅ Thành công! Ứng dụng phản hồi HTTP 200 (Lần thử: $i)"
-              exit 0
-            fi
-
-            echo "⏳ Lần thử $i: HTTP $code - App đang khởi động, đợi 5s..."
-            sleep 5
-          done
-
-          echo "❌ Thất bại! Ứng dụng không phản hồi sau 10 lần thử."
-          exit 1
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            check() {
+              name=$1; url=$2
+              for i in $(seq 1 12); do
+                code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$url")
+                if [ "$code" = "200" ]; then
+                  echo "✅ $name OK (HTTP 200, lần thử $i)"
+                  return 0
+                fi
+                echo "⏳ $name lần thử $i: HTTP $code, đợi 5s..."
+                sleep 5
+              done
+              echo "❌ $name không phản hồi"
+              return 1
+            }
+            check "Frontend" "http://localhost:3000"
+            check "Backend"  "http://localhost:8080/health"
