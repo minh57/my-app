@@ -1,6 +1,16 @@
 node_modules
 .next
 .git
+.github
 .gitignore
-npm-debug.log
+.env
+.env.*
+!.env.example
+npm-debug.log*
 README.md
+AGENTS.md
+docs
+nginx
+docker-compose.yml
+backend/target
+backend/.mvn
