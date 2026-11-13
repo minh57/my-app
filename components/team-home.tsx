@@ -97,7 +97,7 @@ export function TeamHome() {
             <div className="eyebrow"><span /> NHÓM THỰC HÀNH FULLSTACK</div>
             <h1 id="hero-title">
               {info?.groupName ?? DEFAULT_TEAM.groupName}
-              <span>Cùng học.<br />Cùng xây dựng.</span>
+              <span>Cùng học.<br />Cùng start up.</span>
             </h1>
             <p>{info?.description ?? DEFAULT_TEAM.description}.<br className="desktop-break" /> Từ những dòng code đầu tiên đến một sản phẩm chạy thật.</p>
             <a className="hero-cta" href="#members">Gặp gỡ đội ngũ <Icon name="arrow" size={18} /></a>
